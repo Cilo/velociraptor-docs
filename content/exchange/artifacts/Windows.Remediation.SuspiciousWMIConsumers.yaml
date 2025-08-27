@@ -1,0 +1,109 @@
+name: Windows.Remediation.SuspiciousWMIConsumers
+author: Cillian Fagan - @[X/Twitter](https://x.com/cillian_fagan) / [LinkedIn](https://www.linkedin.com/in/cillian-fagan-b4b8523b)
+description: |
+   # WMI Consumer Removal Artifact
+   ## This artifact enables the removal of WMI Event Consumers returned from the `Exchange.Windows.Analysis.SuspiciousWMIConsumers` artifact (ensure this has been downloaded via the Exchange first).
+   General approach taken was to borrow from existing artifacts: the `Exchange.Windows.Remediation.Glob`, `Windows.Remediation.ScheduledTasks`, & basing it around results returned from the `Exchange.Windows.Analysis.SuspiciousWMIConsumers` artifact. This has been tested in organization-wide compromise Red Team exercises.
+   
+   `Note`: if `Exchange.Windows.Analysis.SuspiciousWMIConsumers` is believed to miss some WMI persistence instance(s), consider modifying/switching to `Windows.Persistence.PermanentWMIEvents`, which grabs everything regardless of suspicious keywords. However, the same columns returned might need to be refactored with in this artifact.
+   
+   ## Below parameters enable more granularity when targeting WMIEventConsumers to remove.
+   ## Change `ReallyDoIt` parameter to `Y`/`TRUE` only when you are positive it will affect only malicious WMI consumers.
+   
+   After you `ReallyDoIt` - consider rerunning the `Analysis` artifact again to ensure the attackers didn't anticipate your remediation actions with some sneaky ACL shenanigans (proper scoping would alleviate this - however this artifact aids if your hand is being forced), or that they distributed the samemore WMIEvent consumers in the meantime; or run the following command (modified you your needs) to manually verify a host that was affected: `Get-WmiObject -Namespace root/subscription -Class <CommandLineEventConsumer|ActiveScriptEventConsumer> -Filter "Name = '<replace me with real name filter>'" `.
+reference:
+    - https://github.com/redcanaryco/atomic-red-team/blob/master/atomics/T1546.003/T1546.003.md
+
+type: CLIENT
+
+parameters:
+ - name: Script
+   description: Script - to perform the removal actions.
+   default: |
+     $EventConsumerToCleanup = Get-WmiObject -Namespace root/subscription -Class %s -Filter "Name = '%s'"; $EventFilterToCleanup = Get-WmiObject -Namespace root/subscription -Class __EventFilter -Filter "Name = '%s'" ; $FilterConsumerBindingToCleanup = Get-WmiObject -Namespace root/subscription -Query "REFERENCES OF {$($EventConsumerToCleanup.__RELPATH)} WHERE ResultClass = __FilterToConsumerBinding" -ErrorAction SilentlyContinue ; $FilterConsumerBindingToCleanup | Remove-WmiObject ; $EventConsumerToCleanup | Remove-WmiObject ; $EventFilterToCleanup | Remove-WmiObject ;
+ - name: PowerShellExe
+   description: Powershell executable to be used on the target windows host when running the removal script.
+   default: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+ - name: paramConsumerName
+   description: (ConsumerDetails.) Name - regex of the WMI Event Consumer Name (applies to either `CommandLineEventConsumer`/`ActiveScriptEventConsumer`).
+   default: .
+   type: regex
+ - name: paramFilterName
+   description: (FilterDetails.) FilterName - regex of the WMI Consumer Filter Name of the WMI Event Consumer (applies to either `CommandLineEventConsumer`/`ActiveScriptEventConsumer`).
+   default: .
+   type: regex
+ - name: paramFilterQuery
+   description: (FilterDetails.) FilterQuery - regex of the WMI Consumer Filter Query of the WMI Event Consumer (applies to either `CommandLineEventConsumer`/`ActiveScriptEventConsumer`).
+   default: .
+   type: regex
+ - name: paramCommandLineTemplate
+   description: (ConsumerDetails.) CommandLineTemplate - regex of the `CommandLineTemplate` value for the given `CommandLineEventConsumer` instance.
+   default: .
+   type: regex
+ - name: paramScriptFilename
+   description: (ConsumerDetails.) ScriptFilename -  regex of the `ScriptFilename` value for the given `ActiveScriptEventConsumer` instance.
+   default: .
+   type: regex
+ - name: paramScriptText
+   description: (ConsumerDetails.) ScriptText - regex of the `ScriptText` value for the given `ActiveScriptEventConsumer` instance.
+   default: .
+   type: regex
+ - name: paramFqdn
+   description: Fqdn of target host - in case you want to be more surgical or if labeling is not comprehensive/granular enough.
+   default: .
+   type: regex
+ - name: ReallyDoIt
+   description: Boolean value to prevent accidental removal of legitimate WMIConsumer - verify before setting to `TRUE`/`Y`.
+   type: bool
+   default: N
+
+sources:
+  - precondition:
+      SELECT OS From info() where OS = 'windows'
+
+    query: |
+        -- Gathering needed columns from artifact `Exchange.Windows.Analysis.SuspiciousWMIConsumers`
+        LET targetWmiConsumers = SELECT ConsumerDetails.Name AS ConsumerName,
+            ConsumerDetails.CommandLineTemplate              AS CommandLineTemplate,
+            ConsumerDetails.ScriptingEngine                  AS ScriptingEngine,
+            ConsumerDetails.ScriptFilename                   AS ScriptFilename,
+            ConsumerDetails.ScriptText                       AS ScriptText,
+            FilterDetails.Name                               AS FilterName,
+            FilterDetails.Query                              AS FilterQuery
+        FROM Artifact.Exchange.Windows.Analysis.SuspiciousWMIConsumers()
+        -- Appling filtering from parameters
+        WHERE (ConsumerName =~ paramConsumerName AND FilterName =~ paramFilterName AND FilterQuery =~ paramFilterQuery)
+            AND (
+                CommandLineTemplate =~ paramCommandLineTemplate 
+                OR ( ScriptFilename =~ paramScriptFilename AND ScriptText =~ paramScriptText )
+                )
+            AND Fqdn =~ paramFqdn
+        
+        LET RemoveSuspiciousWmiConsumers = SELECT * FROM foreach(row=targetWmiConsumers,
+            query={
+                SELECT * 
+                FROM if(condition=CommandLineTemplate, 
+                    then={
+                    SELECT ConsumerName, get(member="CommandLineTemplate") AS CommandLineTemplate, get(member="ScriptingEngine") AS ScriptingEngine, get(member="ScriptFilename") AS ScriptFilename, get(member="ScriptText") AS ScriptText,  FilterName, FilterQuery, TRUE as RemoveAttempted
+                    FROM execve(argv=[PowerShellExe, 
+                        "-ExecutionPolicy", "Unrestricted", "-encodedCommand",
+                        base64encode(string=utf16_encode(
+                            string=format(format=Script, args=["CommandLineEventConsumer", ConsumerName, FilterName] ) ) )
+                    ]) WHERE TRUE 
+                    AND log(message="Removing WMI Consumer: '%s'", args=[ConsumerName] ) 
+                        
+                    }, else={ 
+                        -- assuming ActiveScriptEventConsumer if not CommandLineEventConsumer
+                        SELECT ConsumerName, get(member="CommandLineTemplate") AS CommandLineTemplate, ScriptingEngine, get(member="ScriptFilename") AS ScriptFilename, get(member="ScriptText") AS ScriptText, FilterName, FilterQuery, TRUE as RemoveAttempted
+                        FROM execve(argv=[PowerShellExe,
+                            "-ExecutionPolicy", "Unrestricted", "-encodedCommand",
+                            base64encode(string=utf16_encode(
+                                string=format(format=Script, args=["ActiveScriptEventConsumer", ConsumerName, FilterName] ) ) )
+                        ] ) WHERE TRUE AND log(message="Removing WMI Consumer: '%s'", args=[ConsumerName] )
+                    } )
+            } )
+        
+        SELECT ConsumerName, get(member="CommandLineTemplate") AS CommandLineTemplate, get(member="ScriptingEngine") AS ScriptingEngine, get(member="ScriptFilename") AS ScriptFilename, get(member="ScriptText") AS ScriptText, FilterName, FilterQuery, RemoveAttempted
+        FROM if(condition=ReallyDoIt,
+        then= RemoveSuspiciousWmiConsumers,
+        else= { SELECT *, FALSE as RemoveAttempted FROM targetWmiConsumers } )
